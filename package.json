@@ -13,7 +13,7 @@
   },
   "engines": {
     "yarn": ">=1.7.0 <2",
-    "node": ">=20.10.0 <21"
+    "node": ">=12.14.1"
   },
   "devDependencies": {
     "@eclipse-dash/nodejs-wrapper": "^0.0.1",
