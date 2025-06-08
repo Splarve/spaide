@@ -3,7 +3,7 @@
  * All rights reserved. This code is proprietary and confidential.
  ********************************************************************************/
 
-import { injectable, inject } from '@theia/core/shared/inversify';
+import { injectable, inject, postConstruct } from '@theia/core/shared/inversify';
 import { Command, CommandContribution, CommandRegistry } from '@theia/core/lib/common/command';
 import { MenuContribution, MenuModelRegistry } from '@theia/core/lib/common/menu';
 import { CommonMenus } from '@theia/core/lib/browser/common-frontend-contribution';
@@ -16,6 +16,9 @@ import { Emitter } from '@theia/core/lib/common/event';
 import { BinaryBuffer } from '@theia/core/lib/common/buffer';
 import { ApplicationShell } from '@theia/core/lib/browser/shell/application-shell';
 import { DesignData, DEFAULT_DESIGN_DATA, DESIGN_FILE_PATH, Component } from '../common/file-utils';
+import { DesignToolRegistry } from './tools/tool-registry';
+import { AddRectangleTool, AddTextTool, MoveComponentTool, GetComponentsTool } from './tools/canvas-tools';
+import { DesignEditorService, DesignEditorWidget as IDesignEditorWidget } from './services/design-editor-service';
 
 export namespace DesignAgentCommands {
     export const OPEN_VIEWER: Command = {
@@ -26,6 +29,11 @@ export namespace DesignAgentCommands {
     export const OPEN_EDITOR: Command = {
         id: 'designAgent.openEditor',
         label: 'Open Design Editor'
+    };
+
+    export const TEST_TOOLS: Command = {
+        id: 'designAgent.testTools',
+        label: 'Test Design Tools'
     };
 }
 
@@ -138,7 +146,7 @@ export class DesignViewerWidget extends BaseWidget {
 }
 
 @injectable()
-export class DesignEditorWidget extends BaseWidget {
+export class DesignEditorWidget extends BaseWidget implements IDesignEditorWidget {
     static readonly ID = 'design-editor';
     static readonly LABEL = 'Design Editor';
 
@@ -152,7 +160,8 @@ export class DesignEditorWidget extends BaseWidget {
 
     constructor(
         protected readonly workspaceService: WorkspaceService,
-        protected readonly fileService: FileService
+        protected readonly fileService: FileService,
+        protected readonly editorService: DesignEditorService
     ) {
         super();
         this.id = DesignEditorWidget.ID;
@@ -160,6 +169,102 @@ export class DesignEditorWidget extends BaseWidget {
         this.title.closable = true;
         this.addClass('design-editor-widget');
     }
+
+    // ============== PUBLIC API FOR PROGRAMMATIC CONTROL ==============
+    
+    /**
+     * Programmatically add a rectangle to the canvas
+     */
+    public async addRectangleProgrammatically(x?: number, y?: number, width?: number, height?: number): Promise<string> {
+        const newRect: Component = {
+            id: `rect-${this.nextId++}`,
+            type: 'rectangle',
+            text: null,
+            x: x ?? (50 + (this.components.length * 20)),
+            y: y ?? (50 + (this.components.length * 20)),
+            width: width ?? 100,
+            height: height ?? 60
+        };
+        this.components.push(newRect);
+        this.redrawCanvas();
+        await this.saveDesign();
+        console.log('🎨 Programmatically added rectangle:', newRect.id);
+        return newRect.id;
+    }
+
+    /**
+     * Programmatically add text to the canvas
+     */
+    public async addTextProgrammatically(text?: string, x?: number, y?: number): Promise<string> {
+        const newText: Component = {
+            id: `text-${this.nextId++}`,
+            type: 'text',
+            text: text ?? 'Sample Text',
+            x: x ?? (200 + (this.components.length * 20)),
+            y: y ?? (100 + (this.components.length * 20)),
+            width: 100,
+            height: 20
+        };
+        this.components.push(newText);
+        this.redrawCanvas();
+        await this.saveDesign();
+        console.log('🎨 Programmatically added text:', newText.id);
+        return newText.id;
+    }
+
+    /**
+     * Programmatically move a component
+     */
+    public async moveComponentProgrammatically(componentId: string, x: number, y: number): Promise<boolean> {
+        const component = this.components.find(c => c.id === componentId);
+        if (!component) {
+            console.warn('🎨 Component not found:', componentId);
+            return false;
+        }
+        
+        component.x = x;
+        component.y = y;
+        this.redrawCanvas();
+        await this.saveDesign();
+        console.log('🎨 Moved component:', componentId, 'to', x, y);
+        return true;
+    }
+
+    /**
+     * Programmatically delete a component
+     */
+    public async deleteComponentProgrammatically(componentId: string): Promise<boolean> {
+        const index = this.components.findIndex(c => c.id === componentId);
+        if (index === -1) {
+            console.warn('🎨 Component not found:', componentId);
+            return false;
+        }
+        
+        this.components.splice(index, 1);
+        if (this.selectedComponent?.id === componentId) {
+            this.selectedComponent = null;
+        }
+        this.redrawCanvas();
+        await this.saveDesign();
+        console.log('🎨 Deleted component:', componentId);
+        return true;
+    }
+
+    /**
+     * Get all components (read-only)
+     */
+    public getComponents(): readonly Component[] {
+        return [...this.components];
+    }
+
+    /**
+     * Get specific component by ID
+     */
+    public getComponent(componentId: string): Component | undefined {
+        return this.components.find(c => c.id === componentId);
+    }
+
+    // ============== END PUBLIC API ==============
 
     protected onAfterAttach(msg: Message): void {
         super.onAfterAttach(msg);
@@ -184,6 +289,15 @@ export class DesignEditorWidget extends BaseWidget {
         this.setupCanvas();
         this.setupEventListeners();
         this.loadDesign();
+        
+        // Register with the service
+        this.editorService.registerEditor(this);
+    }
+
+    protected onBeforeDetach(msg: Message): void {
+        // Unregister from the service
+        this.editorService.unregisterEditor(this.id);
+        super.onBeforeDetach(msg);
     }
 
     private setupCanvas(): void {
@@ -412,6 +526,8 @@ export class DesignEditorWidget extends BaseWidget {
     }
 }
 
+
+
 @injectable()
 export class DesignAgentContribution implements CommandContribution, MenuContribution {
 
@@ -424,11 +540,37 @@ export class DesignAgentContribution implements CommandContribution, MenuContrib
     @inject(ApplicationShell)
     protected readonly shell: ApplicationShell;
 
+    @inject(DesignEditorService)
+    protected readonly editorService: DesignEditorService;
+
+    @inject(DesignToolRegistry)
+    protected readonly toolRegistry: DesignToolRegistry;
+
     private readonly onDesignDataChangedEmitter = new Emitter<DesignData>();
     readonly onDesignDataChanged = this.onDesignDataChangedEmitter.event;
 
     constructor() {
         console.log('🎨 Design Agent Extension loaded successfully!');
+    }
+
+    @postConstruct()
+    protected initializeTools(): void {
+        console.log('🔧 Initializing design tools...');
+        
+        // Create and register tools directly to avoid circular dependency
+        const addRectangleTool = new AddRectangleTool(this.editorService);
+        const addTextTool = new AddTextTool(this.editorService);
+        const moveComponentTool = new MoveComponentTool(this.editorService);
+        const getComponentsTool = new GetComponentsTool(this.editorService);
+        
+        this.toolRegistry.registerTool(addRectangleTool);
+        this.toolRegistry.registerTool(addTextTool);
+        this.toolRegistry.registerTool(moveComponentTool);
+        this.toolRegistry.registerTool(getComponentsTool);
+
+        // Log registry status
+        const status = this.toolRegistry.getRegistryStatus();
+        console.log('🔧 Tool registry initialized:', status);
     }
 
     registerCommands(registry: CommandRegistry): void {
@@ -439,6 +581,10 @@ export class DesignAgentContribution implements CommandContribution, MenuContrib
 
         registry.registerCommand(DesignAgentCommands.OPEN_EDITOR, {
             execute: () => this.openEditor()
+        });
+
+        registry.registerCommand(DesignAgentCommands.TEST_TOOLS, {
+            execute: () => this.testTools()
         });
     }
 
@@ -453,6 +599,12 @@ export class DesignAgentContribution implements CommandContribution, MenuContrib
         menus.registerMenuAction(CommonMenus.VIEW, {
             commandId: DesignAgentCommands.OPEN_EDITOR.id,
             label: DesignAgentCommands.OPEN_EDITOR.label,
+            order: '9_design_agent'
+        });
+
+        menus.registerMenuAction(CommonMenus.VIEW, {
+            commandId: DesignAgentCommands.TEST_TOOLS.id,
+            label: DesignAgentCommands.TEST_TOOLS.label,
             order: '9_design_agent'
         });
     }
@@ -474,7 +626,7 @@ export class DesignAgentContribution implements CommandContribution, MenuContrib
         console.log('🎨 Opening Design Editor...');
         try {
             await this.ensureDesignFileExists();
-            const widget = new DesignEditorWidget(this.workspaceService, this.fileService);
+            const widget = new DesignEditorWidget(this.workspaceService, this.fileService, this.editorService);
             this.shell.addWidget(widget, { area: 'main' });
             this.shell.activateWidget(widget.id);
             console.log('🎨 Design Editor opened successfully');
@@ -511,5 +663,54 @@ export class DesignAgentContribution implements CommandContribution, MenuContrib
     private async getWorkspaceRoot(): Promise<URI | undefined> {
         const workspaceRoots = await this.workspaceService.roots;
         return workspaceRoots[0]?.resource;
+    }
+
+    private async testTools(): Promise<void> {
+        console.log('🧪 Testing design tools...');
+        
+        try {
+            // Test getting available tools
+            const context = { workspaceRoot: (await this.getWorkspaceRoot())?.toString() };
+            const availableTools = this.toolRegistry.getAvailableTools(context);
+            console.log('🧪 Available tools:', availableTools.map(t => t.definition.name));
+
+            // Test tool execution if editor is available
+            const editor = this.editorService.getActiveEditor();
+            if (!editor) {
+                console.log('🧪 No active editor - opening editor first...');
+                await this.openEditor();
+                // Wait a bit for editor to initialize
+                await new Promise(resolve => setTimeout(resolve, 1000));
+            }
+
+            // Test adding a rectangle
+            const rectResult = await this.toolRegistry.executeTool(
+                'canvas.add-rectangle', 
+                { x: 300, y: 200, width: 120, height: 80 }, 
+                context
+            );
+            console.log('🧪 Add rectangle result:', rectResult);
+
+            // Test adding text
+            const textResult = await this.toolRegistry.executeTool(
+                'canvas.add-text',
+                { text: 'Test Tool', x: 400, y: 300 },
+                context
+            );
+            console.log('🧪 Add text result:', textResult);
+
+            // Test getting components
+            const componentsResult = await this.toolRegistry.executeTool(
+                'canvas.get-components',
+                {},
+                context
+            );
+            console.log('🧪 Get components result:', componentsResult);
+
+            console.log('🧪 Tool testing completed successfully!');
+
+        } catch (error) {
+            console.error('🧪 Tool testing failed:', error);
+        }
     }
 }
