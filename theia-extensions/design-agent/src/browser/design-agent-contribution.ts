@@ -34,7 +34,14 @@ export class DesignViewerWidget extends BaseWidget {
     static readonly ID = 'design-viewer';
     static readonly LABEL = 'Design Viewer';
 
-    constructor() {
+    private components: Component[] = [];
+    private canvas: HTMLCanvasElement | null = null;
+    private ctx: CanvasRenderingContext2D | null = null;
+
+    constructor(
+        protected readonly workspaceService: WorkspaceService,
+        protected readonly fileService: FileService
+    ) {
         super();
         this.id = DesignViewerWidget.ID;
         this.title.label = DesignViewerWidget.LABEL;
@@ -46,26 +53,87 @@ export class DesignViewerWidget extends BaseWidget {
         super.onAfterAttach(msg);
         this.node.innerHTML = `
             <div style="padding: 20px; background: #1e1e1e; color: #fff; height: 100%;">
-                <h2>🎨 Design Viewer</h2>
+                <h2>🎨 Design Viewer (Read-Only)</h2>
+                <div style="font-size: 12px; color: #ccc; margin-bottom: 10px;">
+                    📖 Viewing design from .agent/design/design.json
+                </div>
                 <canvas id="viewer-canvas" width="800" height="600" 
                         style="border: 1px solid #444; background: white; display: block; margin-top: 10px;"></canvas>
             </div>
         `;
         this.setupCanvas();
+        this.loadDesign();
     }
 
     private setupCanvas(): void {
-        const canvas = this.node.querySelector('#viewer-canvas') as HTMLCanvasElement;
-        if (canvas) {
-            const ctx = canvas.getContext('2d');
-            if (ctx) {
-                ctx.strokeStyle = 'black';
-                ctx.lineWidth = 1;
-                ctx.font = '14px Arial';
-                ctx.strokeRect(50, 50, 100, 60);
-                ctx.strokeText('Sample Text', 200, 100);
-            }
+        this.canvas = this.node.querySelector('#viewer-canvas') as HTMLCanvasElement;
+        if (this.canvas) {
+            this.ctx = this.canvas.getContext('2d');
+            this.redrawCanvas();
         }
+    }
+
+    private redrawCanvas(): void {
+        if (!this.ctx || !this.canvas) return;
+
+        // Clear canvas
+        this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
+
+        if (this.components.length === 0) {
+            // Show message when no components
+            this.ctx.fillStyle = '#666';
+            this.ctx.font = '16px Arial';
+            this.ctx.fillText('No design components found', 50, 100);
+            this.ctx.font = '14px Arial';
+            this.ctx.fillText('Create some components in the Design Editor first!', 50, 130);
+            return;
+        }
+
+        // Draw components (read-only, no selection highlighting)
+        this.components.forEach(comp => {
+            this.ctx!.strokeStyle = 'black';
+            this.ctx!.lineWidth = 1;
+            this.ctx!.font = '14px Arial';
+
+            if (comp.type === 'rectangle') {
+                this.ctx!.strokeRect(comp.x, comp.y, comp.width, comp.height);
+            } else if (comp.type === 'text') {
+                this.ctx!.fillStyle = 'black';
+                this.ctx!.fillText(comp.text || '', comp.x, comp.y + 15);
+            }
+        });
+    }
+
+    private async loadDesign(): Promise<void> {
+        try {
+            const workspaceRoot = await this.getWorkspaceRoot();
+            if (!workspaceRoot) {
+                console.log('🎨 Viewer: No workspace root found');
+                this.redrawCanvas();
+                return;
+            }
+
+            const designFileUri = workspaceRoot.resolve(DESIGN_FILE_PATH);
+            const fileData = await this.fileService.readFile(designFileUri);
+            const designData: DesignData = JSON.parse(fileData.value.toString());
+            
+            this.components = designData.components || [];
+            this.redrawCanvas();
+            console.log('🎨 Viewer: Loaded design with', this.components.length, 'components');
+        } catch (error) {
+            console.log('🎨 Viewer: No design file found, showing empty canvas');
+            this.components = [];
+            this.redrawCanvas();
+        }
+    }
+
+    private async getWorkspaceRoot(): Promise<URI | undefined> {
+        if (!this.workspaceService) {
+            console.error('🎨 Viewer: WorkspaceService is undefined!');
+            return undefined;
+        }
+        const workspaceRoots = await this.workspaceService.roots;
+        return workspaceRoots[0]?.resource;
     }
 }
 
@@ -393,7 +461,7 @@ export class DesignAgentContribution implements CommandContribution, MenuContrib
         console.log('🎨 Opening Design Viewer...');
         try {
             await this.ensureDesignFileExists();
-            const widget = new DesignViewerWidget();
+            const widget = new DesignViewerWidget(this.workspaceService, this.fileService);
             this.shell.addWidget(widget, { area: 'main' });
             this.shell.activateWidget(widget.id);
             console.log('🎨 Design Viewer opened successfully');
