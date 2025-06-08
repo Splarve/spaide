@@ -82,13 +82,10 @@ export class DesignEditorWidget extends BaseWidget {
     private ctx: CanvasRenderingContext2D | null = null;
     private nextId = 1;
 
-    @inject(WorkspaceService)
-    protected readonly workspaceService: WorkspaceService;
-
-    @inject(FileService)
-    protected readonly fileService: FileService;
-
-    constructor() {
+    constructor(
+        protected readonly workspaceService: WorkspaceService,
+        protected readonly fileService: FileService
+    ) {
         super();
         this.id = DesignEditorWidget.ID;
         this.title.label = DesignEditorWidget.LABEL;
@@ -303,25 +300,46 @@ export class DesignEditorWidget extends BaseWidget {
 
     private async saveDesign(): Promise<void> {
         try {
+            // Temporary workaround - save to console for now to test the rest of the logic
+            const designData: DesignData = { components: this.components };
+            console.log('🎨 Would save design:', JSON.stringify(designData, undefined, 2));
+            
+            // Try the original approach but with better error handling
             const workspaceRoot = await this.getWorkspaceRoot();
             if (!workspaceRoot) {
-                console.error('🎨 No workspace root found');
+                console.error('🎨 No workspace root found - saving to console only');
                 return;
             }
 
             const designFileUri = workspaceRoot.resolve(DESIGN_FILE_PATH);
-            const designData: DesignData = { components: this.components };
+            const designDirUri = designFileUri.parent;
+
+            // Ensure directory exists
+            try {
+                await this.fileService.resolve(designDirUri);
+            } catch {
+                // Directory doesn't exist, create it
+                await this.fileService.createFolder(designDirUri);
+                console.log('🎨 Created design directory:', designDirUri.toString());
+            }
+
             const content = BinaryBuffer.fromString(JSON.stringify(designData, undefined, 2));
             
             await this.fileService.writeFile(designFileUri, content);
-            console.log('🎨 Saved design with', this.components.length, 'components');
+            console.log('🎨 Saved design with', this.components.length, 'components to:', designFileUri.toString());
         } catch (error) {
             console.error('🎨 Error saving design:', error);
         }
     }
 
     private async getWorkspaceRoot(): Promise<URI | undefined> {
+        console.log('🎨 Debug - workspaceService:', this.workspaceService);
+        if (!this.workspaceService) {
+            console.error('🎨 WorkspaceService is undefined!');
+            return undefined;
+        }
         const workspaceRoots = await this.workspaceService.roots;
+        console.log('🎨 Debug - workspaceRoots:', workspaceRoots);
         return workspaceRoots[0]?.resource;
     }
 }
@@ -388,7 +406,7 @@ export class DesignAgentContribution implements CommandContribution, MenuContrib
         console.log('🎨 Opening Design Editor...');
         try {
             await this.ensureDesignFileExists();
-            const widget = new DesignEditorWidget();
+            const widget = new DesignEditorWidget(this.workspaceService, this.fileService);
             this.shell.addWidget(widget, { area: 'main' });
             this.shell.activateWidget(widget.id);
             console.log('🎨 Design Editor opened successfully');
