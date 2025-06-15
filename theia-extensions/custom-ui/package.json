@@ -1,0 +1,45 @@
+{
+  "private": true,
+  "name": "theia-ide-custom-ui-ext",
+  "version": "1.62.100",
+  "description": "Custom UI extension for Theia",
+  "dependencies": {
+    "@theia/core": "1.62.1",
+    "@theia/preferences": "1.62.1",
+    "@theia/workspace": "1.62.1",
+    "inversify": "^6.0.1"
+  },
+  "theiaExtensions": [
+    {
+      "frontend": "lib/browser/custom-ui-frontend-module"
+    }
+  ],
+  "keywords": [
+    "theia-extension"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/eclipse-theia/theia-ide.git"
+  },
+  "bugs": {
+    "url": "https://github.com/eclipse-theia/theia-ide/issues"
+  },
+  "homepage": "https://github.com/eclipse-theia/theia-ide",
+  "files": [
+    "lib",
+    "src"
+  ],
+  "scripts": {
+    "clean": "rimraf lib *.tsbuildinfo",
+    "build": "tsc -b",
+    "lint": "eslint --ext js,jsx,ts,tsx src",
+    "lint:fix": "eslint --ext js,jsx,ts,tsx src --fix",
+    "update:theia": "ts-node ../../scripts/update-theia-version.ts",
+    "update:next": "ts-node ../../scripts/update-theia-version.ts next"
+  },
+  "devDependencies": {
+    "rimraf": "^2.7.1",
+    "typescript": "^4.5.5"
+  }
+} 

@@ -1,6 +1,6 @@
 {
   "private": true,
-  "name": "design-agent-ext",
+  "name": "theia-ide-design-agent-ext",
   "version": "1.0.0",
   "description": "Design Agent Wireframe Canvas Extension",
   "dependencies": {

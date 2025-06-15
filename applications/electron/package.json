@@ -118,7 +118,8 @@
     "theia-ide-launcher-ext": "1.62.100",
     "theia-ide-product-ext": "1.62.100",
     "theia-ide-updater-ext": "1.62.100",
-    "design-agent-ext": "1.0.0"
+    "theia-ide-design-agent-ext": "1.0.0",
+    "theia-ide-custom-ui-ext": "1.62.100"
   },
   "devDependencies": {
     "@theia/cli": "1.62.1",
