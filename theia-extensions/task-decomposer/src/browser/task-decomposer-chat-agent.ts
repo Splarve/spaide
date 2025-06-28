@@ -46,16 +46,18 @@ export class TaskDecomposerChatAgent extends AbstractStreamParsingChatAgent {
     );
 
     /** The system prompt text injected into every request. */
-    private static readonly SYSTEM_PROMPT_TEXT = `You are a task decomposition assistant. Given a high-level task from the user, break it down into 3-10 concise, ordered subtasks.
+    private static readonly SYSTEM_PROMPT_TEXT = `You are a task decomposition assistant. Given a high-level task from the user, break it down into 3-10 concise, ordered subtasks with categories.
 
 RESPONSE FORMAT (strict):
-{"subtasks": ["<step 1>", "<step 2>" ...]}
+{"subtasks": [{"label": "<step 1>", "category": "<category>"}, {"label": "<step 2>", "category": "<category>"}, ...]}
+
+Categories: "code", "design", "research", "test", "deploy"
 
 Rules:
 1. Respond with a SINGLE line of pure JSON. No markdown, no code fences, no explanations.
 2. Use double quotes (\") for all strings.
-3. Do NOT include any additional keys in the object.
-4. Each subtask must be actionable and start with a verb.`;
+3. Each subtask must be actionable and start with a verb.
+4. Assign appropriate categories to help with visual organization.`;
 
     /**
      * Provide the system message description directly, bypassing PromptService,
@@ -70,8 +72,21 @@ Rules:
             const text = request.response.response.asString?.() ?? '';
             const json = JSON.parse(text);
             if (json && Array.isArray(json.subtasks)) {
-                const nodes = json.subtasks.map((label: string, idx: number) => ({ id: 'n' + idx, label })) as any;
-                this.store.setDecomposition({ id: 'root', label: 'Task', children: nodes });
+                const nodes = json.subtasks.map((task: any, idx: number) => ({
+                    id: 'n' + idx,
+                    label: typeof task === 'string' ? task : task.label,
+                    category: typeof task === 'object' ? task.category : 'code'
+                }));
+                
+                // Extract the user's original message as the root task name
+                const userMessage = (request as any)?.request?.messages?.find((m: any) => m.actor?.kind === 'user')?.content || 'Task';
+                const rootLabel = userMessage.length > 60 ? userMessage.substring(0, 57) + '...' : userMessage;
+                
+                this.store.setDecomposition({ 
+                    id: 'root', 
+                    label: rootLabel, 
+                    children: nodes 
+                });
             }
         } catch (err) {
             // ignore parse errors for now

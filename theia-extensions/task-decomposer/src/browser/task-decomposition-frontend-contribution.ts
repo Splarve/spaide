@@ -42,7 +42,7 @@ export class TaskDecompositionFrontendContribution implements CommandContributio
             console.log('🔧 Widget created:', widget);
 
             if (!widget.isAttached) {
-                // Add to the main area by default
+                // Add to the main area (center) for better visual space
                 console.log('🔧 Attaching widget to main area');
                 this.shell.addWidget(widget, { area: 'main' });
             }
