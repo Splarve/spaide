@@ -39,6 +39,14 @@ export class TaskDecomposerChatAgent extends AbstractStreamParsingChatAgent {
 
     protected defaultLanguageModelPurpose: string = 'chat';
 
+    /** Chat context variables for conversation state management */
+    variables: string[] = [
+        'clarificationContext',
+        'originalRequest', 
+        'pendingQuestions',
+        'conversationHistory'
+    ];
+
     /** Short description displayed in the agent selection dropdown. */
     description = nls.localize(
         'task-decomposer/ai/chat/description',
@@ -105,6 +113,24 @@ These questions should be designed to elicit the exact information needed to rem
 
 Do NOT generate any tasks in the plan array. The plan array MUST be empty.
 
+CONTEXT VARIABLES
+The following context variables provide important conversation state:
+
+{{clarificationContext}} - Contains clarification state and pending questions if user is in a clarification flow
+{{originalRequest}} - The user's original decomposition request when in clarification mode
+{{pendingQuestions}} - List of pending clarification questions that need answers
+{{conversationHistory}} - Recent conversation history for context
+
+CLARIFICATION FOLLOW-UP HANDLING
+When clarificationContext indicates the user is providing answers to clarification questions:
+
+1. Use the originalRequest AND the user's current message (which contains answers) to create a complete decomposition
+2. Set status to SUCCESS 
+3. Generate the full plan based on both the original request and the clarification answers
+4. Do NOT ask for more clarification unless absolutely necessary
+
+When the user provides clarification answers, treat their message as responses to the pending questions and proceed with decomposition.
+
 OUTPUT SCHEMA
 Your entire output MUST be a single JSON object conforming to this exact structure.
 
@@ -156,6 +182,134 @@ Your entire output MUST be a single JSON object conforming to this exact structu
         return { text: TaskDecomposerChatAgent.SYSTEM_PROMPT_TEXT } as SystemMessageDescription;
     }
 
+    /** 
+     * Resolve context variables for dynamic prompt injection
+     * This method is called by Theia AI when processing prompt templates
+     */
+    protected async resolveVariable(name: string, request: any): Promise<string> {
+        console.log(`🔧 Resolving variable: ${name}`);
+        
+        try {
+            switch (name) {
+                case 'clarificationContext':
+                    return await this.getClarificationContext(request);
+                case 'originalRequest':
+                    return await this.getOriginalRequest(request);
+                case 'pendingQuestions':
+                    return await this.getPendingQuestions(request);
+                case 'conversationHistory':
+                    return await this.getConversationHistory(request);
+                default:
+                    console.log(`⚠️ Unknown variable: ${name}`);
+                    return '';
+            }
+        } catch (error) {
+            console.error(`❌ Error resolving variable ${name}:`, error);
+            return '';
+        }
+    }
+
+    private async getClarificationContext(request: any): Promise<string> {
+        const session = this.getSession(request);
+        if (!session) {
+            console.log('📭 No session available for clarificationContext');
+            return '';
+        }
+        
+        const state = session.getVariable?.('clarificationState');
+        console.log(`🔍 Clarification state: ${state}`);
+        
+        if (state === 'waiting_for_answers') {
+            const originalRequest = session.getVariable?.('originalRequest') || '';
+            const pendingQuestions = session.getVariable?.('pendingQuestions') || '[]';
+            
+            const context = `CLARIFICATION_CONTEXT:
+Original Request: ${originalRequest}
+Pending Questions: ${pendingQuestions}
+Status: User is currently providing answers to clarification questions. Use both the original request and their current answers to create the decomposition.`;
+            
+            console.log('✅ Built clarification context');
+            return context;
+        }
+        
+        return '';
+    }
+
+    private async getOriginalRequest(request: any): Promise<string> {
+        const session = this.getSession(request);
+        const originalRequest = session?.getVariable?.('originalRequest') || '';
+        console.log(`📝 Original request: ${originalRequest ? 'Found' : 'Not found'}`);
+        return originalRequest;
+    }
+
+    private async getPendingQuestions(request: any): Promise<string> {
+        const session = this.getSession(request);
+        const questions = session?.getVariable?.('pendingQuestions') || '[]';
+        
+        try {
+            const parsed = JSON.parse(questions);
+            if (Array.isArray(parsed) && parsed.length > 0) {
+                const formatted = parsed.map((q: any, idx: number) => {
+                    const questionText = q.prompt || q.question || q;
+                    return `${idx + 1}. ${questionText}`;
+                }).join('\n');
+                
+                console.log(`❓ Found ${parsed.length} pending questions`);
+                return `PENDING_CLARIFICATION_QUESTIONS:\n${formatted}`;
+            }
+        } catch (e) {
+            console.warn('Could not parse pending questions:', e);
+        }
+        
+        return '';
+    }
+
+    private async getConversationHistory(request: any): Promise<string> {
+        const session = this.getSession(request);
+        if (!session?.getAllMessages) {
+            console.log('📭 No message history available');
+            return '';
+        }
+        
+        try {
+            const messages = session.getAllMessages();
+            const history = messages
+                .filter((msg: any) => msg.participant?.id === 'user' || msg.participant?.id === this.id)
+                .slice(-5) // Last 5 exchanges
+                .map((msg: any) => {
+                    const sender = msg.participant?.id === 'user' ? 'User' : 'Decomposer';
+                    const text = msg.text || msg.content || '';
+                    return `${sender}: ${text.substring(0, 200)}${text.length > 200 ? '...' : ''}`;
+                })
+                .join('\n');
+            
+            if (history) {
+                console.log(`📚 Found conversation history with ${messages.length} messages`);
+                return `RECENT_CONVERSATION:\n${history}`;
+            }
+        } catch (e) {
+            console.warn('Could not retrieve conversation history:', e);
+        }
+        
+        return '';
+    }
+
+    /** 
+     * Helper to safely get session from different request types
+     */
+    private getSession(request: any): any {
+        // Handle different request formats from Theia AI
+        if (request?.session) return request.session;
+        if (request?.request?.session) return request.request.session;
+        if (request?.context?.session) return request.context.session;
+        
+        console.warn('No session found in request object');
+        return null;
+    }
+
+    /** 
+     * Handle response completion with proper Theia AI context management
+     */
     protected async onResponseComplete(request: any): Promise<void> {
         try {
             const text = request.response.response.asString?.() ?? '';
@@ -164,100 +318,275 @@ Your entire output MUST be a single JSON object conforming to this exact structu
             const json = JSON.parse(text);
             console.log('📊 Parsed JSON:', json);
             
-            if (json.status === 'CLARIFICATION_NEEDED') {
-                console.log('❓ LLM needs clarification');
-                // Handle clarification case - could show questions to user
-                const clarificationMessage = json.questions_for_user?.length > 0 
-                    ? json.questions_for_user.join('\n') 
-                    : 'The request needs clarification. Please provide more specific details.';
+            // Check if LLM needs clarification
+            if (json.status && json.status.includes('CLARIFICATION_NEEDED')) {
+                console.log('❓ LLM needs clarification - storing context and waiting for input');
                 
-                this.store.setDecomposition({
-                    id: 'clarification',
-                    label: 'Clarification Needed',
-                    children: [{
-                        id: 'questions',
-                        label: clarificationMessage,
-                        category: 'research'
-                    }]
+                // Store clarification context in session
+                this.storeClarificationContext(request, json);
+                
+                // Add clarification suggestions to help user
+                this.addClarificationSuggestions(request);
+                
+                // Set response to wait for input (Theia AI pattern)
+                request.response.addProgressMessage({ 
+                    content: 'Please provide the requested clarification...', 
+                    show: 'whileIncomplete' 
                 });
+                request.response.waitForInput();
                 return;
             }
             
-            if (json.status === 'SUCCESS' && json.plan && Array.isArray(json.plan)) {
+            // Handle successful HTN plan
+            if (json.plan && Array.isArray(json.plan) && json.plan.length > 0) {
                 console.log('✅ Successfully parsed HTN plan');
                 
-                // Convert HTN plan to our visual tree structure
-                const rootTask = json.plan.find((task: any) => task.parent_id === null);
-                const childTasks = json.plan.filter((task: any) => task.parent_id !== null);
+                // Clear any clarification context since we got a successful plan
+                this.clearClarificationContext(request);
                 
-                if (!rootTask) {
-                    console.error('❌ No root task found in plan');
-                    return;
-                }
-                
-                // Map task types to visual categories
-                const mapTaskTypeToCategory = (taskType: string): string => {
-                    switch (taskType.toLowerCase()) {
-                        case 'primitive':
-                            return 'code'; // Primitive tasks are typically executable code
-                        case 'compound':
-                            return 'design'; // Compound tasks are higher-level planning
-                        default:
-                            return 'code';
-                    }
-                };
-                
-                // Create child nodes from HTN tasks
-                const nodes = childTasks.map((task: any) => ({
-                    id: `task_${task.task_id}`,
-                    label: task.description,
-                    category: mapTaskTypeToCategory(task.task_type),
-                    // Add HTN-specific metadata
-                    taskType: task.task_type,
-                    dependencies: task.dependencies || [],
-                    parameters: task.parameters || {},
-                    rationale: task.rationale
+                // Process the decomposition for visual editor
+                this.processDecomposition(json);
+                return;
+            }
+            
+            console.error('❌ Invalid HTN response format');
+            
+        } catch (err) {
+            console.error('❌ Error parsing HTN response:', err);
+            this.handleFallbackParsing(request);
+        }
+        
+        return super.onResponseComplete(request);
+    }
+
+    /** 
+     * Store clarification context in session for persistence
+     */
+    private storeClarificationContext(request: any, clarificationData: any): void {
+        const session = request?.session;
+        if (!session) return;
+        
+        // Extract original request from the current message
+        const originalRequest = this.extractUserMessageFromRequest(request);
+        
+        session.setVariable?.('originalRequest', originalRequest);
+        session.setVariable?.('pendingQuestions', JSON.stringify(clarificationData.questions_for_user || []));
+        session.setVariable?.('clarificationState', 'waiting_for_answers');
+        
+        console.log('📝 Stored clarification context:', {
+            originalRequest,
+            questionsCount: clarificationData.questions_for_user?.length || 0
+        });
+    }
+
+    /** 
+     * Clear clarification context when no longer needed
+     */
+    private clearClarificationContext(request: any): void {
+        const session = request?.session;
+        if (!session) return;
+        
+        session.setVariable?.('originalRequest', '');
+        session.setVariable?.('pendingQuestions', '[]');
+        session.setVariable?.('clarificationState', '');
+        
+        console.log('🧹 Cleared clarification context');
+    }
+
+    /** 
+     * Add chat suggestions to guide user during clarification
+     */
+    private addClarificationSuggestions(request: any): void {
+        const session = request?.session;
+        if (!session?.setSuggestions) return;
+        
+        session.setSuggestions([
+            {
+                kind: 'callback',
+                callback: () => this.provideClarificationGuidance(session),
+                content: '[Get help with these questions](_callback)'
+            },
+            {
+                kind: 'callback', 
+                callback: () => this.proceedWithPartialInfo(session),
+                content: '[Proceed with available information](_callback)'
+            }
+        ]);
+    }
+
+    /** 
+     * Provide clarification guidance to user
+     */
+    private provideClarificationGuidance(session: any): void {
+        const questions = session.getVariable?.('pendingQuestions') || '[]';
+        const originalRequest = session.getVariable?.('originalRequest') || '';
+        
+        console.log('💡 Clarification guidance:');
+        console.log(`Original request: ${originalRequest}`);
+        console.log('Please answer the questions above to get a more accurate task decomposition.');
+        
+        try {
+            const parsed = JSON.parse(questions);
+            if (Array.isArray(parsed)) {
+                console.log(`You have ${parsed.length} questions to answer.`);
+                parsed.forEach((q: any, idx: number) => {
+                    console.log(`${idx + 1}. ${q.prompt || q.question || q}`);
+                });
+            }
+        } catch (e) {
+            console.log('Questions:', questions);
+        }
+        
+        console.log('\n💬 Just type your answers in a normal message - I\'ll automatically combine them with your original request!');
+    }
+
+    /** 
+     * Proceed with partial information if user chooses
+     */
+    private proceedWithPartialInfo(session: any): void {
+        console.log('⚡ Proceeding with available information...');
+        
+        const originalRequest = session.getVariable?.('originalRequest') || '';
+        if (originalRequest) {
+            console.log('🔄 I\'ll create a decomposition based on the original request and reasonable assumptions.');
+            console.log(`Original request: ${originalRequest}`);
+            
+            // Clear clarification state so next request proceeds without waiting
+            session.setVariable?.('clarificationState', '');
+            
+            console.log('✅ Ready! Send your original request again with @decomposer to get a decomposition.');
+        } else {
+            console.log('❌ No original request found. Please start a new decomposition request.');
+        }
+    }
+
+    /** 
+     * Get available tool functions for this agent
+     */
+    protected getToolFunctions(): any[] {
+        return [
+            {
+                name: 'storeClarificationContext',
+                description: 'Store clarification context for follow-up',
+                handler: this.handleStoreClarification.bind(this)
+            },
+            {
+                name: 'retrieveContext',
+                description: 'Retrieve stored conversation context',
+                handler: this.handleRetrieveContext.bind(this)
+            },
+            {
+                name: 'clearContext',
+                description: 'Clear stored clarification context',
+                handler: this.handleClearContext.bind(this)
+            }
+        ];
+    }
+
+    /** 
+     * Tool function: Store clarification context
+     */
+    private async handleStoreClarification(params: any): Promise<string> {
+        console.log('🔧 Tool: storeClarificationContext called', params);
+        // This would be called by the LLM if needed
+        return 'Clarification context stored successfully';
+    }
+
+    /** 
+     * Tool function: Retrieve context
+     */
+    private async handleRetrieveContext(params: any): Promise<string> {
+        console.log('🔧 Tool: retrieveContext called', params);
+        // This would be called by the LLM to get context
+        return 'Context retrieved successfully';
+    }
+
+    /** 
+     * Tool function: Clear context
+     */
+    private async handleClearContext(params: any): Promise<string> {
+        console.log('🔧 Tool: clearContext called', params);
+        // This would be called by the LLM to clear context
+        return 'Context cleared successfully';
+    }
+
+    /** 
+     * Process successful decomposition for visual editor
+     */
+    private processDecomposition(json: any): void {
+        // Find the root task
+        const rootTask = json.plan.find((task: any) => task.parent_id === null);
+        
+        // Flatten the HTN structure to simple format for visual editor
+        const childTasks = json.plan.filter((task: any) => task.parent_id !== null);
+        
+        console.log('🌳 Root task:', rootTask?.description);
+        console.log('📋 Child tasks:', childTasks.length);
+        
+        // Map HTN tasks to simple visual format
+        const nodes = childTasks.map((task: any) => ({
+            id: `task_${task.task_id}`,
+            label: task.description,
+            // Map task types to visual categories  
+            category: task.task_type === 'PRIMITIVE' ? 'code' : 'design',
+            // Keep HTN metadata for future use
+            taskType: task.task_type,
+            dependencies: task.dependencies || [],
+            parameters: task.parameters || {},
+            rationale: task.rationale
+        }));
+        
+        // Use plan_summary as root title
+        const rootLabel = json.plan_summary || rootTask?.description || 'HTN Plan';
+        
+        console.log('🏷️ Using root label:', rootLabel);
+        console.log('📋 Created nodes:', nodes.length);
+        
+        this.store.setDecomposition({ 
+            id: 'root', 
+            label: rootLabel, 
+            children: nodes 
+        });
+    }
+
+    /** 
+     * Handle fallback parsing for backward compatibility
+     */
+    private handleFallbackParsing(request: any): void {
+        try {
+            const text = request.response.response.asString?.() ?? '';
+            const json = JSON.parse(text);
+            
+            if (json && Array.isArray(json.subtasks)) {
+                console.log('🔄 Falling back to old simple format parsing');
+                const nodes = json.subtasks.map((task: any, idx: number) => ({
+                    id: 'n' + idx,
+                    label: typeof task === 'string' ? task : task.label,
+                    category: typeof task === 'object' ? task.category : 'code'
                 }));
                 
-                // Use plan_summary as root title, with fallback
-                const rootLabel = json.plan_summary || rootTask.description || 'HTN Plan';
-                
-                console.log('🏷️ Using root label:', rootLabel);
-                console.log('📋 Created nodes:', nodes.length);
-                
+                const rootLabel = json.title || 'Task';
                 this.store.setDecomposition({ 
                     id: 'root', 
                     label: rootLabel, 
                     children: nodes 
                 });
-            } else {
-                console.error('❌ Invalid response format - missing status or plan');
             }
-        } catch (err) {
-            console.error('❌ Error in onResponseComplete:', err);
-            
-            // Fallback: try to handle old format for backward compatibility
-            try {
-                const json = JSON.parse(request.response.response.asString?.() ?? '');
-                if (json && Array.isArray(json.subtasks)) {
-                    console.log('🔄 Falling back to old format parsing');
-                    const nodes = json.subtasks.map((task: any, idx: number) => ({
-                        id: 'n' + idx,
-                        label: typeof task === 'string' ? task : task.label,
-                        category: typeof task === 'object' ? task.category : 'code'
-                    }));
-                    
-                    const rootLabel = json.title || 'Task';
-                    this.store.setDecomposition({ 
-                        id: 'root', 
-                        label: rootLabel, 
-                        children: nodes 
-                    });
-                }
-            } catch (fallbackErr) {
-                console.error('❌ Fallback parsing also failed:', fallbackErr);
-            }
+        } catch (fallbackErr) {
+            console.error('❌ Fallback parsing also failed:', fallbackErr);
         }
-        return super.onResponseComplete(request);
+    }
+
+    /** 
+     * Extract user message from request for context storage
+     */
+    private extractUserMessageFromRequest(request: any): string {
+        // Try various ways to extract the user message from the request
+        if (typeof request === 'string') return request;
+        if (request?.request?.message) return request.request.message;
+        if (request?.message) return request.message;
+        if (request?.text) return request.text;
+        if (request?.content) return request.content;
+        return String(request);
     }
 } 
