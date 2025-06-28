@@ -422,6 +422,9 @@ export class TaskDecompositionWidget extends BaseWidget {
             this.updateNodeSize(node);
             this.nodes.push(node);
             this.selectedNode = node;
+            
+            // Reapply auto-layout when adding tasks
+            this.applyAutoLayout();
             this.updateEmptyState();
             this.render();
         }
@@ -461,11 +464,12 @@ export class TaskDecompositionWidget extends BaseWidget {
         this.nodes = [];
         this.connections = [];
 
+        // Add root node (positioned by auto-layout)
         const rootNode: TaskNode = {
             id: root.id,
             label: root.label,
-            x: 200,
-            y: 50,
+            x: 0, // Will be set by auto-layout
+            y: 0, // Will be set by auto-layout
             width: 0,
             height: 0,
             isRoot: true,
@@ -475,13 +479,14 @@ export class TaskDecompositionWidget extends BaseWidget {
         this.updateNodeSize(rootNode);
         this.nodes.push(rootNode);
 
+        // Add child nodes (positioned by auto-layout)
         if (root.children) {
             root.children.forEach((child, index) => {
                 const childNode: TaskNode = {
                     id: child.id,
                     label: child.label,
-                    x: 50 + (index * 200),
-                    y: 150,
+                    x: 0, // Will be set by auto-layout
+                    y: 0, // Will be set by auto-layout
                     width: 0,
                     height: 0,
                     category: child.category,
@@ -497,8 +502,69 @@ export class TaskDecompositionWidget extends BaseWidget {
             });
         }
 
+        // Apply auto-layout
+        this.applyAutoLayout();
         this.updateEmptyState();
         this.render();
+    }
+
+    protected applyAutoLayout(): void {
+        if (this.nodes.length === 0) return;
+
+        const rootNode = this.nodes.find(n => n.isRoot);
+        const childNodes = this.nodes.filter(n => !n.isRoot);
+        
+        if (!rootNode) return;
+
+        const canvasRect = this.canvas.getBoundingClientRect();
+        const margin = 40;
+        const verticalSpacing = 100;
+        
+        // Position root node at top center
+        rootNode.x = (canvasRect.width / 2) - (rootNode.width / 2) - this.viewport.x;
+        rootNode.y = margin - this.viewport.y;
+
+        if (childNodes.length === 0) return;
+
+        // Calculate total width needed for all child nodes
+        const totalChildWidth = childNodes.reduce((sum, node) => sum + node.width, 0);
+        const minSpacing = 20;
+        const totalSpacingWidth = (childNodes.length - 1) * minSpacing;
+        const totalRequiredWidth = totalChildWidth + totalSpacingWidth;
+        
+        // Calculate available width and adjust spacing
+        const availableWidth = canvasRect.width - (2 * margin);
+        let actualSpacing = minSpacing;
+        
+        if (totalRequiredWidth < availableWidth) {
+            // If we have extra space, distribute it evenly
+            const extraSpace = availableWidth - totalRequiredWidth;
+            actualSpacing = minSpacing + (extraSpace / (childNodes.length - 1 || 1));
+        }
+
+        // Position child nodes in a row below the root
+        let currentX = margin - this.viewport.x;
+        const childY = rootNode.y + rootNode.height + verticalSpacing;
+
+        // If nodes don't fit, start from a calculated center position
+        if (totalRequiredWidth > availableWidth) {
+            currentX = (canvasRect.width / 2) - (totalRequiredWidth / 2) - this.viewport.x;
+            actualSpacing = minSpacing; // Use minimum spacing when cramped
+        }
+
+        childNodes.forEach((node, index) => {
+            node.x = currentX;
+            node.y = childY;
+            currentX += node.width + actualSpacing;
+        });
+
+        // Center the root node over the child nodes if needed
+        if (childNodes.length > 0) {
+            const firstChild = childNodes[0];
+            const lastChild = childNodes[childNodes.length - 1];
+            const childrenCenterX = (firstChild.x + (lastChild.x + lastChild.width)) / 2;
+            rootNode.x = childrenCenterX - (rootNode.width / 2);
+        }
     }
 
     protected saveToStore(): void {
@@ -619,7 +685,7 @@ export class TaskDecompositionWidget extends BaseWidget {
 
             // Text
             this.ctx.fillStyle = textColor;
-            const fontSize = (node.isRoot ? 14 : 12) / this.viewport.zoom;
+            const fontSize = node.isRoot ? 14 : 12;
             this.ctx.font = `${node.isRoot ? 'bold' : 'normal'} ${fontSize}px sans-serif`;
             this.ctx.textAlign = 'center';
             this.ctx.textBaseline = 'middle';
@@ -634,11 +700,18 @@ export class TaskDecompositionWidget extends BaseWidget {
                 displayText += '...';
             }
             
+            // Save context and reset transform for text rendering
+            this.ctx.save();
+            this.ctx.setTransform(1, 0, 0, 1, 0, 0); // Reset transform
+            this.ctx.translate(this.viewport.x, this.viewport.y); // Apply only translation
+            
             this.ctx.fillText(
                 displayText,
-                node.x + node.width / 2,
-                node.y + node.height / 2
+                (node.x + node.width / 2) * this.viewport.zoom,
+                (node.y + node.height / 2) * this.viewport.zoom
             );
+            
+            this.ctx.restore(); // Restore previous transform
 
             // Status indicator
             if (node.status && !node.isRoot) {
@@ -664,14 +737,21 @@ export class TaskDecompositionWidget extends BaseWidget {
                     'deploy': '🚀'
                 };
                 
+                // Save context and reset transform for icon rendering
+                this.ctx.save();
+                this.ctx.setTransform(1, 0, 0, 1, 0, 0);
+                this.ctx.translate(this.viewport.x, this.viewport.y);
+                
                 this.ctx.fillStyle = '#666';
-                this.ctx.font = `${10 / this.viewport.zoom}px sans-serif`;
+                this.ctx.font = '10px sans-serif';
                 this.ctx.textAlign = 'left';
                 this.ctx.fillText(
                     iconMap[node.category] || '•',
-                    node.x + 4,
-                    node.y + 12
+                    (node.x + 4) * this.viewport.zoom,
+                    (node.y + 12) * this.viewport.zoom
                 );
+                
+                this.ctx.restore();
             }
         });
         
