@@ -70,6 +70,8 @@ The JSON output MUST strictly adhere to the schema provided in the "OUTPUT SCHEM
 
 Start your response immediately with { and end it with }.
 
+IMPORTANT: Your JSON response will be processed programmatically. The chat interface will display appropriate natural language messages to the user automatically based on your JSON output. Do NOT include conversational text - only the structured JSON response.
+
 DECOMPOSITION METHODOLOGY
 1. Core Concepts (Hierarchical Task Network - HTN)
 You will decompose the user's goal into a hierarchy of COMPOUND and PRIMITIVE tasks.
@@ -175,11 +177,39 @@ Your entire output MUST be a single JSON object conforming to this exact structu
 }`;
 
     /**
-     * Provide the system message description directly, bypassing PromptService,
-     * so we are independent from prompt registration.
+     * Provide the system message with variable resolution
      */
     protected async getSystemMessageDescription(): Promise<SystemMessageDescription | undefined> {
         return { text: TaskDecomposerChatAgent.SYSTEM_PROMPT_TEXT } as SystemMessageDescription;
+    }
+
+    /**
+     * Override to inject context variables into the system prompt
+     */
+    protected async getSystemMessage(request: any): Promise<any> {
+        console.log('🔧 Getting system message with context variables');
+        
+        // Get base system message
+        const baseMessage = await this.getSystemMessageDescription();
+        if (!baseMessage?.text) return baseMessage;
+        
+        // Resolve all variables
+        let processedText = baseMessage.text;
+        
+        for (const variableName of this.variables) {
+            const variableValue = await this.resolveVariable(variableName, request);
+            const placeholder = `{{${variableName}}}`;
+            
+            console.log(`🔧 Replacing ${placeholder} with: ${variableValue ? 'content found' : 'empty'}`);
+            processedText = processedText.replace(new RegExp(placeholder.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), variableValue);
+        }
+        
+        console.log('✅ System message with variables resolved');
+        
+        return {
+            ...baseMessage,
+            text: processedText
+        };
     }
 
     /** 
@@ -216,12 +246,22 @@ Your entire output MUST be a single JSON object conforming to this exact structu
             return '';
         }
         
+        console.log('🔍 Session methods available:', {
+            hasGetVariable: !!session.getVariable,
+            hasSetVariable: !!session.setVariable
+        });
+        
         const state = session.getVariable?.('clarificationState');
-        console.log(`🔍 Clarification state: ${state}`);
+        console.log(`🔍 Clarification state: "${state}"`);
         
         if (state === 'waiting_for_answers') {
             const originalRequest = session.getVariable?.('originalRequest') || '';
             const pendingQuestions = session.getVariable?.('pendingQuestions') || '[]';
+            
+            console.log('🔍 Context variables found:', {
+                originalRequest: originalRequest ? `"${originalRequest.substring(0, 50)}..."` : 'empty',
+                pendingQuestions: pendingQuestions !== '[]' ? 'found' : 'empty'
+            });
             
             const context = `CLARIFICATION_CONTEXT:
 Original Request: ${originalRequest}
@@ -232,6 +272,7 @@ Status: User is currently providing answers to clarification questions. Use both
             return context;
         }
         
+        console.log('⚪ No clarification context needed (state not waiting_for_answers)');
         return '';
     }
 
@@ -299,11 +340,32 @@ Status: User is currently providing answers to clarification questions. Use both
      */
     private getSession(request: any): any {
         // Handle different request formats from Theia AI
-        if (request?.session) return request.session;
-        if (request?.request?.session) return request.request.session;
-        if (request?.context?.session) return request.context.session;
+        if (request?.session) {
+            console.log('✅ Found session in request.session');
+            return request.session;
+        }
+        if (request?.request?.session) {
+            console.log('✅ Found session in request.request.session');
+            return request.request.session;
+        }
+        if (request?.context?.session) {
+            console.log('✅ Found session in request.context.session');
+            return request.context.session;
+        }
         
-        console.warn('No session found in request object');
+        // Check for response object that might have session
+        if (request?.response?.session) {
+            console.log('✅ Found session in request.response.session');
+            return request.response.session;
+        }
+        
+        // Check for chat request model
+        if (request?.chatRequestModel?.session) {
+            console.log('✅ Found session in request.chatRequestModel.session');
+            return request.chatRequestModel.session;
+        }
+        
+        console.warn('❌ No session found in request object:', Object.keys(request || {}));
         return null;
     }
 
@@ -320,19 +382,18 @@ Status: User is currently providing answers to clarification questions. Use both
             
             // Check if LLM needs clarification
             if (json.status && json.status.includes('CLARIFICATION_NEEDED')) {
-                console.log('❓ LLM needs clarification - storing context and waiting for input');
+                console.log('❓ LLM needs clarification - displaying natural language questions');
                 
                 // Store clarification context in session
                 this.storeClarificationContext(request, json);
+                
+                // Replace the JSON response with natural language questions for chat
+                this.displayClarificationQuestions(request, json);
                 
                 // Add clarification suggestions to help user
                 this.addClarificationSuggestions(request);
                 
                 // Set response to wait for input (Theia AI pattern)
-                request.response.addProgressMessage({ 
-                    content: 'Please provide the requested clarification...', 
-                    show: 'whileIncomplete' 
-                });
                 request.response.waitForInput();
                 return;
             }
@@ -344,37 +405,168 @@ Status: User is currently providing answers to clarification questions. Use both
                 // Clear any clarification context since we got a successful plan
                 this.clearClarificationContext(request);
                 
-                // Process the decomposition for visual editor
+                // Process the decomposition for visual editor (JSON goes here)
                 this.processDecomposition(json);
+                
+                // Replace JSON response with natural language success message for chat
+                this.displaySuccessMessage(request, json);
                 return;
             }
             
             console.error('❌ Invalid HTN response format');
+            this.displayErrorMessage(request, 'I couldn\'t create a valid task decomposition. Please try rephrasing your request.');
             
         } catch (err) {
             console.error('❌ Error parsing HTN response:', err);
-            this.handleFallbackParsing(request);
+            
+            // Try fallback parsing
+            if (this.tryFallbackParsing(request)) {
+                return;
+            }
+            
+            // If all parsing fails, show error message
+            this.displayErrorMessage(request, 'I encountered an error processing your request. Please try again.');
         }
         
         return super.onResponseComplete(request);
     }
 
     /** 
+     * Display clarification questions in natural language in the chat
+     */
+    private displayClarificationQuestions(request: any, json: any): void {
+        const questions = json.questions_for_user || [];
+        
+        let chatMessage = 'I need some clarification to create an accurate task decomposition:\n\n';
+        
+        questions.forEach((q: any, idx: number) => {
+            const questionText = q.prompt || q.question || q;
+            const questionType = q.type || '';
+            
+            chatMessage += `**${idx + 1}. ${questionText}**`;
+            if (questionType) {
+                chatMessage += ` *(${questionType})*`;
+            }
+            chatMessage += '\n\n';
+        });
+        
+        chatMessage += 'Please provide your answers, and I\'ll create the task decomposition for you.';
+        
+        // Replace the response content with natural language
+        this.setResponseContent(request, chatMessage);
+        
+        console.log('💬 Displayed clarification questions in chat');
+    }
+
+    /** 
+     * Display success message in chat after processing decomposition
+     */
+    private displaySuccessMessage(request: any, json: any): void {
+        const taskCount = json.plan ? json.plan.filter((task: any) => task.parent_id !== null).length : 0;
+        const planSummary = json.plan_summary || 'task decomposition';
+        
+        let chatMessage = `✅ **Task decomposition complete!**\n\n`;
+        chatMessage += `I've created a structured plan for: *${planSummary}*\n\n`;
+        chatMessage += `📋 **${taskCount} tasks** have been organized in the visual editor.\n\n`;
+        chatMessage += `You can now view, edit, and interact with your task breakdown in the decomposition panel.`;
+        
+        // Replace the response content with natural language
+        this.setResponseContent(request, chatMessage);
+        
+        console.log('✅ Displayed success message in chat');
+    }
+
+    /** 
+     * Display error message in chat
+     */
+    private displayErrorMessage(request: any, message: string): void {
+        const chatMessage = `❌ ${message}`;
+        this.setResponseContent(request, chatMessage);
+        console.log('❌ Displayed error message in chat');
+    }
+
+    /** 
+     * Helper to replace response content for chat display
+     */
+    private setResponseContent(request: any, content: string): void {
+        if (request.response) {
+            // Clear any existing response content
+            request.response.clear?.();
+            
+            // Add the new natural language content
+            request.response.addProgressMessage({
+                content,
+                show: 'always'
+            });
+            
+            // Mark response as complete
+            request.response.complete();
+        }
+    }
+
+    /** 
+     * Try fallback parsing for backward compatibility
+     */
+    private tryFallbackParsing(request: any): boolean {
+        try {
+            const text = request.response.response.asString?.() ?? '';
+            const json = JSON.parse(text);
+            
+            if (json && Array.isArray(json.subtasks)) {
+                console.log('🔄 Using fallback format parsing');
+                
+                const nodes = json.subtasks.map((task: any, idx: number) => ({
+                    id: 'n' + idx,
+                    label: typeof task === 'string' ? task : task.label,
+                    category: typeof task === 'object' ? task.category : 'code'
+                }));
+                
+                const rootLabel = json.title || 'Task';
+                this.store.setDecomposition({ 
+                    id: 'root', 
+                    label: rootLabel, 
+                    children: nodes 
+                });
+                
+                // Show success message for fallback format
+                this.displaySuccessMessage(request, {
+                    plan_summary: rootLabel,
+                    plan: nodes.map(() => ({ parent_id: null })) // Fake structure for counting
+                });
+                
+                return true;
+            }
+        } catch (fallbackErr) {
+            console.error('❌ Fallback parsing also failed:', fallbackErr);
+        }
+        
+        return false;
+    }
+
+    /** 
      * Store clarification context in session for persistence
      */
     private storeClarificationContext(request: any, clarificationData: any): void {
-        const session = request?.session;
+        const session = this.getSession(request);
         if (!session) return;
         
         // Extract original request from the current message
         const originalRequest = this.extractUserMessageFromRequest(request);
         
-        session.setVariable?.('originalRequest', originalRequest);
+        // Only store if we don't already have an original request (don't overwrite)
+        const existingRequest = session.getVariable?.('originalRequest');
+        if (!existingRequest) {
+            session.setVariable?.('originalRequest', originalRequest);
+            console.log('📝 Stored NEW original request:', originalRequest);
+        } else {
+            console.log('📝 Keeping existing original request:', existingRequest);
+        }
+        
         session.setVariable?.('pendingQuestions', JSON.stringify(clarificationData.questions_for_user || []));
         session.setVariable?.('clarificationState', 'waiting_for_answers');
         
         console.log('📝 Stored clarification context:', {
-            originalRequest,
+            originalRequest: session.getVariable?.('originalRequest'),
             questionsCount: clarificationData.questions_for_user?.length || 0
         });
     }
@@ -383,7 +575,7 @@ Status: User is currently providing answers to clarification questions. Use both
      * Clear clarification context when no longer needed
      */
     private clearClarificationContext(request: any): void {
-        const session = request?.session;
+        const session = this.getSession(request);
         if (!session) return;
         
         session.setVariable?.('originalRequest', '');
@@ -397,8 +589,13 @@ Status: User is currently providing answers to clarification questions. Use both
      * Add chat suggestions to guide user during clarification
      */
     private addClarificationSuggestions(request: any): void {
-        const session = request?.session;
-        if (!session?.setSuggestions) return;
+        const session = this.getSession(request);
+        if (!session?.setSuggestions) {
+            console.warn('No setSuggestions method available on session');
+            return;
+        }
+        
+        console.log('🔗 Adding clarification suggestions');
         
         session.setSuggestions([
             {
@@ -446,17 +643,33 @@ Status: User is currently providing answers to clarification questions. Use both
     private proceedWithPartialInfo(session: any): void {
         console.log('⚡ Proceeding with available information...');
         
-        const originalRequest = session.getVariable?.('originalRequest') || '';
-        if (originalRequest) {
+        // Debug session state
+        console.log('🔍 Session debug:', {
+            hasGetVariable: !!session?.getVariable,
+            hasSetVariable: !!session?.setVariable
+        });
+        
+        const originalRequest = session?.getVariable?.('originalRequest') || '';
+        const clarificationState = session?.getVariable?.('clarificationState') || '';
+        const pendingQuestions = session?.getVariable?.('pendingQuestions') || '';
+        
+        console.log('🔍 Session variables:', {
+            originalRequest: originalRequest ? 'Found' : 'Not found',
+            clarificationState,
+            pendingQuestions: pendingQuestions ? 'Found' : 'Not found'
+        });
+        
+        if (originalRequest && originalRequest !== 'Unknown request') {
             console.log('🔄 I\'ll create a decomposition based on the original request and reasonable assumptions.');
             console.log(`Original request: ${originalRequest}`);
             
             // Clear clarification state so next request proceeds without waiting
-            session.setVariable?.('clarificationState', '');
+            session?.setVariable?.('clarificationState', '');
             
             console.log('✅ Ready! Send your original request again with @decomposer to get a decomposition.');
         } else {
             console.log('❌ No original request found. Please start a new decomposition request.');
+            console.log('💡 Try sending a new message like "@decomposer [your task description]"');
         }
     }
 
@@ -549,33 +762,7 @@ Status: User is currently providing answers to clarification questions. Use both
         });
     }
 
-    /** 
-     * Handle fallback parsing for backward compatibility
-     */
-    private handleFallbackParsing(request: any): void {
-        try {
-            const text = request.response.response.asString?.() ?? '';
-            const json = JSON.parse(text);
-            
-            if (json && Array.isArray(json.subtasks)) {
-                console.log('🔄 Falling back to old simple format parsing');
-                const nodes = json.subtasks.map((task: any, idx: number) => ({
-                    id: 'n' + idx,
-                    label: typeof task === 'string' ? task : task.label,
-                    category: typeof task === 'object' ? task.category : 'code'
-                }));
-                
-                const rootLabel = json.title || 'Task';
-                this.store.setDecomposition({ 
-                    id: 'root', 
-                    label: rootLabel, 
-                    children: nodes 
-                });
-            }
-        } catch (fallbackErr) {
-            console.error('❌ Fallback parsing also failed:', fallbackErr);
-        }
-    }
+
 
     /** 
      * Extract user message from request for context storage
@@ -583,10 +770,26 @@ Status: User is currently providing answers to clarification questions. Use both
     private extractUserMessageFromRequest(request: any): string {
         // Try various ways to extract the user message from the request
         if (typeof request === 'string') return request;
+        
+        // Check nested request object first (most common in Theia AI)
+        if (request?.request?.text) return request.request.text;
         if (request?.request?.message) return request.request.message;
-        if (request?.message) return request.message;
+        if (request?.request?.content) return request.request.content;
+        
+        // Check direct properties
         if (request?.text) return request.text;
+        if (request?.message) return request.message;
         if (request?.content) return request.content;
-        return String(request);
+        
+        // Check parts array for text content
+        if (request?.parts && Array.isArray(request.parts)) {
+            for (const part of request.parts) {
+                if (part?.text) return part.text;
+                if (part?.content) return part.content;
+            }
+        }
+        
+        console.warn('Could not extract user message from request:', request);
+        return 'Unknown request';
     }
 } 
